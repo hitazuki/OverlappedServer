@@ -11,6 +11,7 @@ CInitSock theSock;
 
 #define BUFFER_SIZE 1024
 #define WSA_MAXIMUM_WAIT_EVENTS 6
+#define FILE_NAME "qwe.txt"
 
 DWORD WINAPI ServerThread(LPVOID lpParam);
 
@@ -427,6 +428,49 @@ BOOL PostSend(PBUFFER_OBJ pBuffer)
 	return TRUE;
 }
 
+BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
+{
+	FILE *fp = fopen(fileName, "r");
+	if (fp == NULL)
+	{
+		printf("File: %s Not Found!", fileName);
+		return FALSE;
+	}
+	else
+	{
+		int file_block_length = 0;
+		char buffer[BUFFER_SIZE];
+		memset(buffer, 0, sizeof(buffer));
+		while ((file_block_length = fread(buffer, sizeof(char), BUFFER_SIZE, fp)) > 0)
+		{
+			// 为发送数据创建一个BUFFER_OBJ对象，这个对象会在套节字出错或者关闭时释放
+			PBUFFER_OBJ pSend = GetBufferObj(pClient, BUFFER_SIZE);
+			if (pSend == NULL)
+			{
+				printf(" Too much connections! \n");
+				FreeSocketObj(pClient);
+				return FALSE;
+			}
+			printf("file_block_length = %d", file_block_length);
+
+			// 将数据复制到发送缓冲区
+			pSend->nLen = file_block_length;
+			memcpy(pSend->buff, buffer, file_block_length);
+
+			// 投递此发送I/O（将数据回显给客户）
+			if (!PostSend(pSend))
+			{
+				printf("Send File : %s Failed!", fileName);
+				return FALSE;
+			}
+			memset(buffer, 0, sizeof(buffer));
+		}
+		fclose(fp);
+		printf("File: %s Transfer Finished!", fileName);
+		return TRUE;
+	}
+}
+
 BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 {
 	PSOCKET_OBJ pSocket = pBuffer->pSocket; // 从BUFFER_OBJ对象中提取SOCKET_OBJ对象指针，为的是方便引用
@@ -518,8 +562,23 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 				pSend->nLen = dwTrans;
 				pSend->buff[dwTrans] = '\0';
 				printf("from %s/%d: %s\n", inet_ntoa(pSocket->addrRemote.sin_addr), pSocket->addrRemote.sin_port, pBuffer->buff);
+
+				// 收到/recv进入文件传输阶段
+				char *RecvCommand = "/recv:";
+				if (strncmp(RecvCommand, pBuffer->buff, strlen(RecvCommand)) == 0)
+				{
+					if (!SendFile(pSocket, pBuffer->buff + 6))
+					{
+						char* ret_fail = "file not found";
+						pSend->nLen = strlen(ret_fail);
+						strcpy(pSend->buff, ret_fail);
+						//pSend->buff[dwTrans] = '\0'
+						PostSend(pSend);
+					}
+					else PostRecv(pSend);
+				}
 				// 投递发送I/O（将数据回显给客户）
-				PostSend(pSend);
+				else PostSend(pSend);
 			}
 			else	// 套节字关闭
 			{
@@ -546,8 +605,11 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 				// 继续使用这个缓冲区投递接收数据的请求
 				printf("send over\n");
 				pBuffer->nLen = BUFFER_SIZE;
-
-				PostRecv(pBuffer);
+				if (pSocket->nOutstandingOps == 0)
+				{
+					PostRecv(pBuffer);
+				}
+				else FreeBufferObj(pThread, pBuffer);
 			}
 			else	// 套节字关闭
 			{
