@@ -252,7 +252,7 @@ BOOL InsertBufferObj(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 	if (bRet)
 	{
 		::InterlockedIncrement(&g_nCurrentBuffers);
-		printf(" CurrentBuffers: %d \n", g_nCurrentBuffers);
+		printf(" New Buffer CurrentBuffers: %d \n", g_nCurrentBuffers);
 	}
 	return bRet;
 }
@@ -340,7 +340,7 @@ void FreeBufferObj(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 		::GlobalFree(pBuffer->buff);
 		::GlobalFree(pBuffer);	
 		::InterlockedDecrement(&g_nCurrentBuffers);
-		printf(" CurrentBuffers: %d \n", g_nCurrentBuffers);
+		printf(" Free Buffer CurrentBuffers: %d \n", g_nCurrentBuffers);
 	}
 }
 
@@ -430,7 +430,7 @@ BOOL PostSend(PBUFFER_OBJ pBuffer)
 
 BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
 {
-	FILE *fp = fopen(fileName, "r");
+	FILE *fp = fopen(fileName, "rb");
 	if (fp == NULL)
 	{
 		printf("File: %s Not Found!", fileName);
@@ -452,7 +452,7 @@ BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
 				return FALSE;
 			}
 			printf("file_block_length = %d", file_block_length);
-
+			//printf(" %s ", buffer);
 			// 将数据复制到发送缓冲区
 			pSend->nLen = file_block_length;
 			memcpy(pSend->buff, buffer, file_block_length);
@@ -665,7 +665,7 @@ DWORD WINAPI ServerThread(LPVOID lpParam)
 				}
 				else					// 处理网络事件
 				{
-					// 查找对应的套节字对象指针，调用HandleIO处理网络事件
+					// 查找对应的IO对象指针，调用HandleIO处理网络事件
 					PBUFFER_OBJ pBuffer = (PBUFFER_OBJ)FindBufferObj(pThread, i);
 					if (pBuffer != NULL)
 					{
@@ -723,16 +723,13 @@ void main()
 		NULL
 	);
 
-	// 创建用来重新建立g_events数组的事件对象
-	//g_events[0] = ::WSACreateEvent();
 	::InitializeCriticalSection(&g_cs);
 	// 在此可以投递多个接受I/O请求，GetBufferObj已创建处理请求的线程
 	for(int i=0; i<5; i++)
 	{
 		PostAccept(GetBufferObj(pListen, BUFFER_SIZE));
 	}
-	//::WSASetEvent(g_events[0]);
-	//printf("g_nBufferCount:%d\n", g_nBufferCount);
+
 	while (true);
 	::DeleteCriticalSection(&g_cs);
 
