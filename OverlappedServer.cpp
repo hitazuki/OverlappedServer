@@ -22,6 +22,7 @@ typedef struct _SOCKET_OBJ
 	SOCKADDR_IN addrLocal;			// 本地地址
 	SOCKADDR_IN addrRemote;			// 客户地址
 	_SOCKET_OBJ *pNext;
+	CRITICAL_SECTION s_cs;
 
 	LPFN_ACCEPTEX lpfnAcceptEx;		// 扩展函数AcceptEx的指针（仅对监听套节字而言）
 	LPFN_GETACCEPTEXSOCKADDRS lpfnGetAcceptExSockaddrs;
@@ -64,6 +65,7 @@ CRITICAL_SECTION g_cs;			// 同步对此全局变量的访问
 
 								// 状态信息
 LONG g_nCurrentBuffers;		// 当前IO数量
+LONG g_nFileSendSeq;        // 发送序列数
 
 // 打印线程状态
 void PrintThread()
@@ -111,10 +113,11 @@ PSOCKET_OBJ GetSocketObj(SOCKET s)
 	{
 		pSocket->s = s;
 	}
+	::InitializeCriticalSection(&pSocket->s_cs);
 	return pSocket;
 }
 
-// 将socket对象添加到列表中
+// 将socket对象添加到列表中，由于accpet套接字的存在，与GetSocektObj分开写
 void AddSocketObj(PSOCKET_OBJ pSocket)
 {
 	if (pSocket != NULL)
@@ -129,6 +132,7 @@ void AddSocketObj(PSOCKET_OBJ pSocket)
 
 void FreeSocketObj(PSOCKET_OBJ pSocket)
 {
+	::EnterCriticalSection(&pSocket->s_cs);
 	// 在线程对象列表中查找pThread所指的对象，如果找到就从中移除
 	::EnterCriticalSection(&g_cs);
 	PSOCKET_OBJ p = g_pSocketList;
@@ -153,6 +157,8 @@ void FreeSocketObj(PSOCKET_OBJ pSocket)
 	// 释放资源
 	if(pSocket->s != INVALID_SOCKET)
 		::closesocket(pSocket->s);
+	::LeaveCriticalSection(&pSocket->s_cs);
+	::DeleteCriticalSection(&pSocket->s_cs);
 	::GlobalFree(pSocket);
 	printf("a socket has been closed\n");
 	PrintSocket();
@@ -336,6 +342,7 @@ void FreeBufferObj(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 	// 释放它占用的内存空间
 	if(bFind)
 	{
+		printf("nOutstandingOps:%d\n", pBuffer->pSocket->nOutstandingOps);
 		::CloseHandle(pBuffer->ol.hEvent);
 		::GlobalFree(pBuffer->buff);
 		::GlobalFree(pBuffer);	
@@ -363,7 +370,9 @@ BOOL PostAccept(PBUFFER_OBJ pBuffer)
 	{	
 		// 设置I/O类型，增加套节字上的重叠I/O计数
 		pBuffer->nOperation = OP_ACCEPT;
+		::EnterCriticalSection(&pSocket->s_cs);
 		pSocket->nOutstandingOps ++;
+		::LeaveCriticalSection(&pSocket->s_cs);
 
 		// 投递此重叠I/O  
 		DWORD dwBytes;
@@ -391,7 +400,9 @@ BOOL PostRecv(PBUFFER_OBJ pBuffer)
 {	
 	// 设置I/O类型，增加套节字上的重叠I/O计数
 	pBuffer->nOperation = OP_READ;
+	::EnterCriticalSection(&pBuffer->pSocket->s_cs);
 	pBuffer->pSocket->nOutstandingOps ++;
+	::LeaveCriticalSection(&pBuffer->pSocket->s_cs);
 
 	// 投递此重叠I/O
 	DWORD dwBytes;
@@ -411,7 +422,9 @@ BOOL PostSend(PBUFFER_OBJ pBuffer)
 {
 	// 设置I/O类型，增加套节字上的重叠I/O计数
 	pBuffer->nOperation = OP_WRITE;
+	::EnterCriticalSection(&pBuffer->pSocket->s_cs);
 	pBuffer->pSocket->nOutstandingOps ++;
+	::LeaveCriticalSection(&pBuffer->pSocket->s_cs);
 
 	// 投递此重叠I/O
 	DWORD dwBytes;
@@ -451,7 +464,8 @@ BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
 				FreeSocketObj(pClient);
 				return FALSE;
 			}
-			printf("file_block_length = %d", file_block_length);
+			::InterlockedIncrement(&g_nFileSendSeq);
+			printf("g_nFileSendSeq: %d\nfile_block_length = %d", g_nFileSendSeq, file_block_length);
 			//printf(" %s ", buffer);
 			// 将数据复制到发送缓冲区
 			pSend->nLen = file_block_length;
@@ -474,7 +488,9 @@ BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
 BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 {
 	PSOCKET_OBJ pSocket = pBuffer->pSocket; // 从BUFFER_OBJ对象中提取SOCKET_OBJ对象指针，为的是方便引用
+	::EnterCriticalSection(&pSocket->s_cs);
 	pSocket->nOutstandingOps --;
+
 
 	// 获取重叠操作结果
 	DWORD dwTrans;
@@ -484,11 +500,14 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 	{
 		// 在此套节字上有错误发生，因此，关闭套节字，移除此缓冲区对象。
 		// 如果没有其它抛出的I/O请求了，释放此缓冲区对象，否则，等待此套节字上的其它I/O也完成
+		::EnterCriticalSection(&pSocket->s_cs);
 		if(pSocket->s != INVALID_SOCKET)
 		{
 			::closesocket(pSocket->s);
 			pSocket->s = INVALID_SOCKET;
 		}
+		::LeaveCriticalSection(&pSocket->s_cs);
+		::LeaveCriticalSection(&pSocket->s_cs);
 
 		if(pSocket->nOutstandingOps == 0)
 			FreeSocketObj(pSocket);	
@@ -512,6 +531,7 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			{
 				printf(" Too much connections! \n");
 				FreeSocketObj(pClient);
+				::LeaveCriticalSection(&pSocket->s_cs);
 				return FALSE;
 			}
 			RebuildArray(pThread);
@@ -545,8 +565,9 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			if(!PostSend(pSend))
 			{
 				// 万一出错的话，释放上面刚申请的两个对象
-				FreeSocketObj(pSocket);	
+				FreeSocketObj(pClient);	
 				FreeBufferObj(pThread, pSend);
+				::LeaveCriticalSection(&pSocket->s_cs);
 				return FALSE;
 			}
 			// 继续投递接受I/O
@@ -584,12 +605,14 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			{
 	
 				// 必须先关闭套节字，以便在此套节字上投递的其它I/O也返回
+				::EnterCriticalSection(&pSocket->s_cs);
 				if(pSocket->s != INVALID_SOCKET)
 				{
 					::closesocket(pSocket->s);
 					pSocket->s = INVALID_SOCKET;
 				}
-
+				::LeaveCriticalSection(&pSocket->s_cs);
+				::LeaveCriticalSection(&pSocket->s_cs);
 				if(pSocket->nOutstandingOps == 0)
 					FreeSocketObj(pSocket);		
 				
@@ -614,12 +637,14 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			else	// 套节字关闭
 			{
 				// 同样，要先关闭套节字
+				::EnterCriticalSection(&pSocket->s_cs);
 				if(pSocket->s != INVALID_SOCKET)
 				{
 					::closesocket(pSocket->s);
 					pSocket->s = INVALID_SOCKET;
 				}
-
+				::LeaveCriticalSection(&pSocket->s_cs);
+				::LeaveCriticalSection(&pSocket->s_cs);
 				if(pSocket->nOutstandingOps == 0)
 					FreeSocketObj(pSocket);	
 
@@ -629,6 +654,7 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 		}
 		break;
 	}
+	::LeaveCriticalSection(&pSocket->s_cs);
 	return TRUE;
 }
 
