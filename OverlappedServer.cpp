@@ -10,7 +10,7 @@
 CInitSock theSock;
 
 #define BUFFER_SIZE 1024
-#define WSA_MAXIMUM_WAIT_EVENTS 6
+#define WSA_MAXIMUM_WAIT_EVENTS 11
 #define FILE_NAME "qwe.txt"
 
 DWORD WINAPI ServerThread(LPVOID lpParam);
@@ -34,7 +34,7 @@ typedef struct _BUFFER_OBJ
 	char *buff;				// send/recv/AcceptEx所使用的缓冲区
 	int nLen;				// buff的长度
 	PSOCKET_OBJ pSocket;	// 此I/O所属的套节字对象
-
+	LONG nFileSendSeq;
 	int nOperation;			// 提交的操作类型
 #define OP_ACCEPT	1
 #define OP_READ		2
@@ -154,13 +154,13 @@ void FreeSocketObj(PSOCKET_OBJ pSocket)
 	}
 	::LeaveCriticalSection(&g_cs);
 
+	printf("%s/%d a socket has been closed\n", inet_ntoa(pSocket->addrRemote.sin_addr), pSocket->addrRemote.sin_port);
 	// 释放资源
 	if(pSocket->s != INVALID_SOCKET)
 		::closesocket(pSocket->s);
 	::LeaveCriticalSection(&pSocket->s_cs);
 	::DeleteCriticalSection(&pSocket->s_cs);
 	::GlobalFree(pSocket);
-	printf("a socket has been closed\n");
 	PrintSocket();
 }
 
@@ -342,7 +342,7 @@ void FreeBufferObj(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 	// 释放它占用的内存空间
 	if(bFind)
 	{
-		printf("nOutstandingOps:%d\n", pBuffer->pSocket->nOutstandingOps);
+		//printf("nOutstandingOps:%d\n", pBuffer->pSocket->nOutstandingOps);
 		::CloseHandle(pBuffer->ol.hEvent);
 		::GlobalFree(pBuffer->buff);
 		::GlobalFree(pBuffer);	
@@ -403,6 +403,7 @@ BOOL PostRecv(PBUFFER_OBJ pBuffer)
 	::EnterCriticalSection(&pBuffer->pSocket->s_cs);
 	pBuffer->pSocket->nOutstandingOps ++;
 	::LeaveCriticalSection(&pBuffer->pSocket->s_cs);
+	printf("++Recv nOutstandingOps:%d nFileSendSeq: %d\n", pBuffer->pSocket->nOutstandingOps, pBuffer->nFileSendSeq);
 
 	// 投递此重叠I/O
 	DWORD dwBytes;
@@ -425,6 +426,7 @@ BOOL PostSend(PBUFFER_OBJ pBuffer)
 	::EnterCriticalSection(&pBuffer->pSocket->s_cs);
 	pBuffer->pSocket->nOutstandingOps ++;
 	::LeaveCriticalSection(&pBuffer->pSocket->s_cs);
+	printf("++Send nOutstandingOps:%d nFileSendSeq: %d\n", pBuffer->pSocket->nOutstandingOps, pBuffer->nFileSendSeq);
 
 	// 投递此重叠I/O
 	DWORD dwBytes;
@@ -460,12 +462,13 @@ BOOL SendFile(PSOCKET_OBJ pClient, char* fileName)
 			PBUFFER_OBJ pSend = GetBufferObj(pClient, BUFFER_SIZE);
 			if (pSend == NULL)
 			{
-				printf(" Too much connections! \n");
+				printf(" Too much buffers! \n");
 				FreeSocketObj(pClient);
 				return FALSE;
 			}
 			::InterlockedIncrement(&g_nFileSendSeq);
-			printf("g_nFileSendSeq: %d\nfile_block_length = %d", g_nFileSendSeq, file_block_length);
+			pSend->nFileSendSeq = g_nFileSendSeq;
+			printf("g_nFileSendSeq: %d file_block_length = %d\n", g_nFileSendSeq, file_block_length);
 			//printf(" %s ", buffer);
 			// 将数据复制到发送缓冲区
 			pSend->nLen = file_block_length;
@@ -490,8 +493,8 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 	PSOCKET_OBJ pSocket = pBuffer->pSocket; // 从BUFFER_OBJ对象中提取SOCKET_OBJ对象指针，为的是方便引用
 	::EnterCriticalSection(&pSocket->s_cs);
 	pSocket->nOutstandingOps --;
-
-
+	::LeaveCriticalSection(&pSocket->s_cs);
+	printf("--nOutstandingOps:%d nFileSendSeq: %d\n", pSocket->nOutstandingOps, pBuffer->nFileSendSeq);
 	// 获取重叠操作结果
 	DWORD dwTrans;
 	DWORD dwFlags;
@@ -507,9 +510,8 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			pSocket->s = INVALID_SOCKET;
 		}
 		::LeaveCriticalSection(&pSocket->s_cs);
-		::LeaveCriticalSection(&pSocket->s_cs);
 
-		if(pSocket->nOutstandingOps == 0)
+		if(pSocket->nOutstandingOps <= 0)
 			FreeSocketObj(pSocket);	
 		
 		FreeBufferObj(pThread, pBuffer);
@@ -531,7 +533,6 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 			{
 				printf(" Too much connections! \n");
 				FreeSocketObj(pClient);
-				::LeaveCriticalSection(&pSocket->s_cs);
 				return FALSE;
 			}
 			RebuildArray(pThread);
@@ -567,9 +568,20 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 				// 万一出错的话，释放上面刚申请的两个对象
 				FreeSocketObj(pClient);	
 				FreeBufferObj(pThread, pSend);
-				::LeaveCriticalSection(&pSocket->s_cs);
 				return FALSE;
 			}
+
+			// 为发送数据创建一个BUFFER_OBJ对象，这个对象会在套节字出错或者关闭时释放
+			PBUFFER_OBJ pRecv = GetBufferObj(pClient, BUFFER_SIZE);
+			if (pSend == NULL)
+			{
+				printf(" Too much buffers! \n");
+				FreeSocketObj(pClient);
+				return FALSE;
+			}
+			pRecv->nLen = BUFFER_SIZE;
+			PostRecv(pRecv);
+
 			// 继续投递接受I/O
 			PostAccept(pBuffer);
 		}
@@ -578,11 +590,16 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 		{
 			if(dwTrans > 0)
 			{
-				// 创建一个缓冲区，以发送数据。这里就使用原来的缓冲区
-				PBUFFER_OBJ pSend = pBuffer;
-				pSend->nLen = dwTrans;
-				pSend->buff[dwTrans] = '\0';
+				pBuffer->buff[dwTrans] = '\0';
 				printf("from %s/%d: %s\n", inet_ntoa(pSocket->addrRemote.sin_addr), pSocket->addrRemote.sin_port, pBuffer->buff);
+				// 为发送数据创建一个BUFFER_OBJ对象，这个对象会在套节字出错或者关闭时释放
+				PBUFFER_OBJ pSend = GetBufferObj(pSocket, BUFFER_SIZE);
+				if (pSend == NULL)
+				{
+					printf(" Too much buffers! \n");
+					FreeSocketObj(pSocket);
+					return FALSE;
+				}
 
 				// 收到/recv进入文件传输阶段
 				char *RecvCommand = "/recv:";
@@ -593,13 +610,21 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 						char* ret_fail = "file not found";
 						pSend->nLen = strlen(ret_fail);
 						strcpy(pSend->buff, ret_fail);
-						//pSend->buff[dwTrans] = '\0'
 						PostSend(pSend);
 					}
-					else PostRecv(pSend);
+					else FreeBufferObj(pThread, pSend);
 				}
-				// 投递发送I/O（将数据回显给客户）
-				else PostSend(pSend);
+				else {
+					// 将数据复制到发送缓冲区
+					pSend->nLen = dwTrans;
+					strcpy(pSend->buff, pBuffer->buff);
+					// 投递发送I/O（将数据回显给客户）
+					PostSend(pSend);
+				}
+
+				// 接收buffer继续工作
+				pBuffer->nLen = BUFFER_SIZE;
+				PostRecv(pBuffer);
 			}
 			else	// 套节字关闭
 			{
@@ -612,8 +637,8 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 					pSocket->s = INVALID_SOCKET;
 				}
 				::LeaveCriticalSection(&pSocket->s_cs);
-				::LeaveCriticalSection(&pSocket->s_cs);
-				if(pSocket->nOutstandingOps == 0)
+
+				if(pSocket->nOutstandingOps <= 0)
 					FreeSocketObj(pSocket);		
 				
 				FreeBufferObj(pThread, pBuffer);
@@ -625,14 +650,8 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 		{
 			if(dwTrans > 0)
 			{
-				// 继续使用这个缓冲区投递接收数据的请求
 				printf("send over\n");
-				pBuffer->nLen = BUFFER_SIZE;
-				if (pSocket->nOutstandingOps == 0)
-				{
-					PostRecv(pBuffer);
-				}
-				else FreeBufferObj(pThread, pBuffer);
+				FreeBufferObj(pThread, pBuffer);
 			}
 			else	// 套节字关闭
 			{
@@ -644,8 +663,8 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 					pSocket->s = INVALID_SOCKET;
 				}
 				::LeaveCriticalSection(&pSocket->s_cs);
-				::LeaveCriticalSection(&pSocket->s_cs);
-				if(pSocket->nOutstandingOps == 0)
+
+				if(pSocket->nOutstandingOps <= 0)
 					FreeSocketObj(pSocket);	
 
 				FreeBufferObj(pThread, pBuffer);
@@ -654,7 +673,6 @@ BOOL HandleIO(PTHREAD_OBJ pThread, PBUFFER_OBJ pBuffer)
 		}
 		break;
 	}
-	::LeaveCriticalSection(&pSocket->s_cs);
 	return TRUE;
 }
 
@@ -695,8 +713,10 @@ DWORD WINAPI ServerThread(LPVOID lpParam)
 					PBUFFER_OBJ pBuffer = (PBUFFER_OBJ)FindBufferObj(pThread, i);
 					if (pBuffer != NULL)
 					{
+						::EnterCriticalSection(&pBuffer->pSocket->s_cs);
 						if (!HandleIO(pThread, pBuffer))
 							RebuildArray(pThread);
+						::LeaveCriticalSection(&pBuffer->pSocket->s_cs);
 					}
 					else
 						printf(" Unable to find socket object \n ");
@@ -758,41 +778,4 @@ void main()
 
 	while (true);
 	::DeleteCriticalSection(&g_cs);
-
-	/*while(TRUE)
-	{
-		int nIndex = 
-			::WSAWaitForMultipleEvents(g_nBufferCount + 1, g_events, FALSE, WSA_INFINITE, FALSE);
-		if(nIndex == WSA_WAIT_FAILED)
-		{
-			printf("WSAWaitForMultipleEvents() failed \n");
-			break;
-		}
-		nIndex = nIndex - WSA_WAIT_EVENT_0;
-		for(int i=0; i<=nIndex; i++)
-		{
-			int nRet = ::WSAWaitForMultipleEvents(1, &g_events[i], TRUE, 0, FALSE);
-			if(nRet == WSA_WAIT_TIMEOUT)
-				continue;
-			else
-			{
-				::WSAResetEvent(g_events[i]);
-				// 重新建立g_events数组
-				if(i == 0)
-				{
-					RebuildArray();
-					continue;
-				}
-
-				// 处理这个I/O
-				PBUFFER_OBJ pBuffer = FindBufferObj(g_events[i]);
-				if(pBuffer != NULL)
-				{
-					if(!HandleIO(pBuffer))
-						RebuildArray();
-					printf("g_nBufferCount:%d\n", g_nBufferCount);
-				}
-			}
-		}
-	}*/
 }
